@@ -1,0 +1,14 @@
+# Core API dependencies
+fastapi
+uvicorn
+python-multipart
+
+# ML dependencies
+tensorflow-cpu==2.15.0
+numpy
+opencv-python-headless>=4.10.0.84
+h5py
+requests
+pydantic
+starlette
+google-cloud-storage
