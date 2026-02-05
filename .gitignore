@@ -89,3 +89,10 @@ venv.bak/
 
 # conda
 .conda/
+
+# Machine Learning Models
+*.h5
+*.pkl
+*.pth
+*.onnx
+saved_models/
