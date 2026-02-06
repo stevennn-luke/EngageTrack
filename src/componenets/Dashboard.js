@@ -37,7 +37,6 @@ function Dashboard() {
   const [showStudentForm, setShowStudentForm] = useState(false);
   const [videoEnded, setVideoEnded] = useState(false);
   const [addUserStep, setAddUserStep] = useState('details');
-  const [currentTip, setCurrentTip] = useState(0);
 
   // Track User section states
   const [showTrackUser, setShowTrackUser] = useState(false);
@@ -247,6 +246,7 @@ function Dashboard() {
       }
 
       setSelectedFile(file);
+      console.log('File selected:', file.name, 'Size:', file.size, 'Type:', file.type);
       setError(null);
       setAnalysisResults(null);
       setVideoEnded(false);
@@ -261,16 +261,12 @@ function Dashboard() {
       }
 
 
-      if (addUserStep === 'upload') {
-        setVideoEnded(true);
-        setTimeout(() => {
-          handleAnalyze();
-        }, 500);
-      }
     }
   };
 
-  const handleAnalyze = async () => {
+  const handleAnalyze = async (fileOverride = null) => {
+    console.log('handleAnalyze called - selectedFile:', selectedFile?.name, 'selectedMode:', selectedMode, 'addUserStep:', addUserStep);
+
     if (selectedMode === 'live') {
       // Start camera for live video
       await startCamera();
@@ -282,7 +278,10 @@ function Dashboard() {
     }
 
     // Handle upload mode
-    if (!selectedFile) {
+    // Use the passed file if available (from auto-analyze), otherwise use state
+    const fileToAnalyze = (fileOverride instanceof File) ? fileOverride : selectedFile;
+
+    if (!fileToAnalyze) {
       setError('Please select a video file first');
       return;
     }
@@ -294,6 +293,8 @@ function Dashboard() {
 
     if (addUserStep !== 'upload') {
       setVideoEnded(false);
+    } else {
+      setVideoEnded(true);
     }
 
 
@@ -305,9 +306,9 @@ function Dashboard() {
 
     try {
       const formData = new FormData();
-      formData.append('file', selectedFile);
+      formData.append('file', fileToAnalyze);
 
-      console.log('Sending video to API for analysis...');
+      console.log('Sending video to API for analysis...', 'File:', fileToAnalyze?.name, 'Size:', fileToAnalyze?.size);
 
       const response = await fetch(`${API_BASE_URL}/predict`, {
         method: 'POST',
@@ -597,9 +598,11 @@ function Dashboard() {
                             <div style={{
                               minHeight: '80px',
                               display: 'flex',
+                              flexDirection: 'column',
                               alignItems: 'center',
                               justifyContent: 'center'
                             }}>
+                              <h4 style={{ margin: '0 0 10px 0', color: '#555', fontSize: '15px' }}>Tips:</h4>
                               <p style={{
                                 fontSize: '14px',
                                 color: '#667eea',
@@ -618,7 +621,12 @@ function Dashboard() {
                                     "Stay hydrated to maintain optimal brain function",
                                     "Create a dedicated study space free from distractions",
                                     "Get adequate sleep to improve attention and memory",
-                                    "Use noise-cancelling headphones to block out distractions"
+                                    "Use noise-cancelling headphones to block out distractions",
+                                    "Follow the 20-20-20 rule: Every 20 minutes, look at 20 feet for 20s",
+                                    "Adjust your screen brightness to match your room lighting",
+                                    "Blink often to keep your eyes moist and reduce irritation",
+                                    "Stretch your shoulders and neck every hour",
+                                    "Organize your workspace to minimize visual clutter"
                                   ];
                                   return tips[Math.floor(Date.now() / 7000) % tips.length];
                                 })()}
@@ -729,7 +737,7 @@ function Dashboard() {
                   {/* Step 1: Student Details */}
                   {addUserStep === 'details' && (
                     <>
-                      <div className="student-form" style={{ maxWidth: '60%', margin: '0 auto' }}>
+                      <div className="student-form" style={{ maxWidth: '60%', margin: '-20px auto 0 auto' }}>
                         <h3 style={{ marginTop: 0, marginBottom: '20px', color: '#333', fontSize: '24px' }}>Student Information</h3>
 
                         <div className="form-group">
@@ -917,9 +925,11 @@ function Dashboard() {
                         marginTop: '20px',
                         minHeight: '60px',
                         display: 'flex',
+                        flexDirection: 'column',
                         alignItems: 'center',
                         justifyContent: 'center'
                       }}>
+                        <h4 style={{ margin: '0 0 10px 0', color: '#555', fontSize: '15px' }}>Tips:</h4>
                         <p style={{
                           fontSize: '14px',
                           color: '#667eea',
@@ -938,7 +948,12 @@ function Dashboard() {
                               "Stay hydrated to maintain optimal brain function",
                               "Create a dedicated study space free from distractions",
                               "Get adequate sleep to improve attention and memory",
-                              "Use noise-cancelling headphones to block out distractions"
+                              "Use noise-cancelling headphones to block out distractions",
+                              "Follow the 20-20-20 rule: Every 20 minutes, look at 20 feet for 20s",
+                              "Adjust your screen brightness to match your room lighting",
+                              "Blink often to keep your eyes moist and reduce irritation",
+                              "Stretch your shoulders and neck every hour",
+                              "Organize your workspace to minimize visual clutter"
                             ];
                             return tips[Math.floor(Date.now() / 7000) % tips.length];
                           })()}
@@ -959,7 +974,7 @@ function Dashboard() {
                   )}
 
                   {/* Step 3: Results - Show in Add User flow OR regular Try It Now flow */}
-                  {analysisResults && ((addUserStep === 'results') || (videoEnded && !showStudentForm && addUserStep !== 'details' && addUserStep !== 'upload')) && (
+                  {analysisResults && !showStudentForm && ((addUserStep === 'results') || (videoEnded && addUserStep !== 'details' && addUserStep !== 'upload')) && (
 
                     <div className="live-analysis-container">
                       {/* Video Preview Section */}
