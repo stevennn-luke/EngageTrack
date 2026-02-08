@@ -2,12 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase/config';
-import { collection, addDoc, getDocs } from 'firebase/firestore';
+import { collection, addDoc, getDocs, doc, setDoc, getDoc } from 'firebase/firestore';
 import logoWhite from '../assets/logo-white.png';
 import homeBg from '../assets/Home-Screen.png';
 import './Dashboard.css';
 import './DashboardRedesign.css';
-
+import RotatingTips from '../RotatingTips';
 // Google Cloud URL
 const API_BASE_URL = 'https://engagetrack-api-938727467811.asia-south1.run.app';
 
@@ -30,7 +30,8 @@ function Dashboard() {
     gender: '',
     email: '',
     rollNumber: '',
-    department: ''
+    department: '',
+    subject: ''
   });
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -42,6 +43,10 @@ function Dashboard() {
   const [showTrackUser, setShowTrackUser] = useState(false);
   const [savedUsers, setSavedUsers] = useState([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(false);
+  const [showAddUserChoice, setShowAddUserChoice] = useState(false);
+  const [showExistingUserSelect, setShowExistingUserSelect] = useState(false);
+  const [selectedTrackUser, setSelectedTrackUser] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
 
   // Profile section states
   const [showProfile, setShowProfile] = useState(false);
@@ -65,13 +70,36 @@ function Dashboard() {
 
   // Initialize profile data 
   useEffect(() => {
-    if (currentUser) {
-      setProfileData(prev => ({
-        ...prev,
-        name: currentUser.displayName || prev.name,
-        email: currentUser.email || prev.email
-      }));
-    }
+    const fetchProfileData = async () => {
+      if (currentUser) {
+        try {
+          const docRef = doc(db, 'users', currentUser.uid);
+          const docSnap = await getDoc(docRef);
+
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            setProfileData({
+              name: data.name || currentUser.displayName || '',
+              email: data.email || currentUser.email || '',
+              phone: data.phone || '',
+              department: data.department || '',
+              role: data.role || ''
+            });
+          } else {
+            // If no profile exists yet, use auth data
+            setProfileData(prev => ({
+              ...prev,
+              name: currentUser.displayName || prev.name,
+              email: currentUser.email || prev.email
+            }));
+          }
+        } catch (error) {
+          console.error("Error fetching profile:", error);
+        }
+      }
+    };
+
+    fetchProfileData();
   }, [currentUser]);
 
   useEffect(() => {
@@ -97,7 +125,7 @@ function Dashboard() {
   // Fetch saved users 
   useEffect(() => {
     const fetchSavedUsers = async () => {
-      if (!showTrackUser || !currentUser) return;
+      if ((!showTrackUser && !showExistingUserSelect) || !currentUser) return;
 
       setIsLoadingUsers(true);
       try {
@@ -130,7 +158,7 @@ function Dashboard() {
     };
 
     fetchSavedUsers();
-  }, [showTrackUser, currentUser]);
+  }, [showTrackUser, showExistingUserSelect, currentUser]);
 
   const startCamera = async () => {
     try {
@@ -389,7 +417,8 @@ function Dashboard() {
           gender: studentInfo.gender || '',
           email: studentInfo.email || '',
           rollNumber: studentInfo.rollNumber || '',
-          department: studentInfo.department || ''
+          department: studentInfo.department || '',
+          subject: studentInfo.subject || ''
         },
         analysisResults: {
           boredom: analysisResults.boredom || { confidence: 0 },
@@ -437,6 +466,34 @@ function Dashboard() {
     }
   };
 
+  const handleSaveProfile = async () => {
+    if (!currentUser) return;
+
+    try {
+      await setDoc(doc(db, 'users', currentUser.uid), {
+        ...profileData,
+        updatedAt: new Date()
+      }, { merge: true });
+
+      setIsEditingProfile(false);
+
+      // Show toast notification
+      const notification = document.createElement('div');
+      notification.textContent = 'Profile updated successfully!';
+      notification.style.cssText = 'position: fixed; top: 80px; right: 20px; background: #4CAF50; color: white; padding: 16px 24px; borderRadius: 8px; boxShadow: 0 4px 12px rgba(0,0,0,0.15); zIndex: 10000; fontSize: 14px; fontWeight: 500;';
+      document.body.appendChild(notification);
+      setTimeout(() => {
+        notification.style.transition = 'opacity 0.3s';
+        notification.style.opacity = '0';
+        setTimeout(() => notification.remove(), 300);
+      }, 3000);
+
+    } catch (error) {
+      console.error("Error saving profile:", error);
+      setError("Failed to save profile changes.");
+    }
+  };
+
   const handleClosePopup = () => {
     if (filePreview && filePreview.startsWith('blob:')) {
       URL.revokeObjectURL(filePreview);
@@ -460,6 +517,9 @@ function Dashboard() {
     });
     setIsAnalyzing(false);
     setAddUserStep('details');
+    setShowAddUserChoice(false);
+    setShowExistingUserSelect(false);
+    setSelectedTrackUser(null);
   };
 
   async function handleLogout() {
@@ -535,7 +595,7 @@ function Dashboard() {
                     <span className="mode-or-text">OR</span>
                   </div>
 
-                  <div className="mode-option" onClick={() => setSelectedMode('upload')}>
+                  <div className="mode-option" onClick={() => { setSelectedMode('upload'); setAddUserStep('upload'); }}>
                     <div className="mode-icon">
                       <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -600,36 +660,17 @@ function Dashboard() {
                               display: 'flex',
                               flexDirection: 'column',
                               alignItems: 'center',
-                              justifyContent: 'center'
+                              justifyContent: 'center',
+                              animation: 'fadeTip 7s ease-in-out infinite'
                             }}>
-                              <h4 style={{ margin: '0 0 10px 0', color: '#555', fontSize: '15px' }}>Tips:</h4>
+                              <h4 style={{ margin: '0 0 4px 0', color: '#555', fontSize: '15px' }}>Tips:</h4>
                               <p style={{
                                 fontSize: '14px',
                                 color: '#667eea',
-                                animation: 'fadeTip 7s ease-in-out infinite',
                                 maxWidth: '350px',
                                 lineHeight: '1.6'
                               }}>
-                                {(() => {
-                                  const tips = [
-                                    "Take short breaks every 25 minutes to refresh your focus",
-                                    "Minimize distractions by turning off notifications during class",
-                                    "Maintain good posture to stay alert and engaged",
-                                    "Practice deep breathing to improve concentration",
-                                    "Take notes actively to enhance retention and focus",
-                                    "Look away from the screen every 20 minutes to reduce eye strain",
-                                    "Stay hydrated to maintain optimal brain function",
-                                    "Create a dedicated study space free from distractions",
-                                    "Get adequate sleep to improve attention and memory",
-                                    "Use noise-cancelling headphones to block out distractions",
-                                    "Follow the 20-20-20 rule: Every 20 minutes, look at 20 feet for 20s",
-                                    "Adjust your screen brightness to match your room lighting",
-                                    "Blink often to keep your eyes moist and reduce irritation",
-                                    "Stretch your shoulders and neck every hour",
-                                    "Organize your workspace to minimize visual clutter"
-                                  ];
-                                  return tips[Math.floor(Date.now() / 7000) % tips.length];
-                                })()}
+                                {<RotatingTips />}
                               </p>
                             </div>
                             <style>{`
@@ -798,6 +839,17 @@ function Dashboard() {
                             placeholder="e.g., Computer Science"
                           />
                         </div>
+
+                        <div className="form-group" style={{ marginTop: '20px' }}>
+                          <label className="form-label">Subject</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            value={studentInfo.subject}
+                            onChange={(e) => setStudentInfo({ ...studentInfo, subject: e.target.value })}
+                            placeholder="e.g., Mathematics"
+                          />
+                        </div>
                       </div>
 
                       <div className="form-actions" style={{ paddingRight: '30px', justifyContent: 'flex-end', display: 'flex', gap: '10px', marginTop: '20px' }}>
@@ -927,36 +979,17 @@ function Dashboard() {
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
-                        justifyContent: 'center'
+                        justifyContent: 'center',
+                        animation: 'fadeTip 7s ease-in-out infinite'
                       }}>
-                        <h4 style={{ margin: '0 0 10px 0', color: '#555', fontSize: '15px' }}>Tips:</h4>
+                        <h4 style={{ margin: '0 0 4px 0', color: '#555', fontSize: '15px' }}>Tips:</h4>
                         <p style={{
                           fontSize: '14px',
                           color: '#667eea',
-                          animation: 'fadeTip 7s ease-in-out infinite',
                           maxWidth: '400px',
                           lineHeight: '1.6'
                         }}>
-                          {(() => {
-                            const tips = [
-                              "Take short breaks every 25 minutes to refresh your focus",
-                              "Minimize distractions by turning off notifications during class",
-                              "Maintain good posture to stay alert and engaged",
-                              "Practice deep breathing to improve concentration",
-                              "Take notes actively to enhance retention and focus",
-                              "Look away from the screen every 20 minutes to reduce eye strain",
-                              "Stay hydrated to maintain optimal brain function",
-                              "Create a dedicated study space free from distractions",
-                              "Get adequate sleep to improve attention and memory",
-                              "Use noise-cancelling headphones to block out distractions",
-                              "Follow the 20-20-20 rule: Every 20 minutes, look at 20 feet for 20s",
-                              "Adjust your screen brightness to match your room lighting",
-                              "Blink often to keep your eyes moist and reduce irritation",
-                              "Stretch your shoulders and neck every hour",
-                              "Organize your workspace to minimize visual clutter"
-                            ];
-                            return tips[Math.floor(Date.now() / 7000) % tips.length];
-                          })()}
+                          <RotatingTips />
                         </p>
                       </div>
                       <style>{`
@@ -1089,7 +1122,13 @@ function Dashboard() {
                               <button
                                 type="button"
                                 className="results-save-btn"
-                                onClick={() => setShowStudentForm(true)}
+                                onClick={() => {
+                                  if (addUserStep === 'results') {
+                                    setShowAddUserChoice(true);
+                                  } else {
+                                    setShowStudentForm(true);
+                                  }
+                                }}
                               >
                                 Add User
                               </button>
@@ -1158,6 +1197,19 @@ function Dashboard() {
                               value={studentInfo.rollNumber}
                               onChange={(e) => setStudentInfo({ ...studentInfo, rollNumber: e.target.value })}
                               placeholder="Enter roll number"
+                            />
+                          </div>
+
+                          <div className="form-group">
+                            <label className="form-label">
+                              Subject
+                            </label>
+                            <input
+                              type="text"
+                              className="form-input"
+                              value={studentInfo.subject}
+                              onChange={(e) => setStudentInfo({ ...studentInfo, subject: e.target.value })}
+                              placeholder="e.g., Mathematics"
                             />
                           </div>
 
@@ -1345,6 +1397,176 @@ function Dashboard() {
       )
       }
 
+      {/* Add User Choice Modal */}
+      {showAddUserChoice && (
+        <div className="popup-overlay" onClick={() => setShowAddUserChoice(false)}>
+          <div className="popup-content" style={{ maxWidth: '500px', padding: '30px' }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0, textAlign: 'center', marginBottom: '30px', color: '#333' }}>How would you like to save?</h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
+              <button
+                onClick={() => {
+                  setShowAddUserChoice(false);
+                  setShowExistingUserSelect(true);
+                }}
+                style={{
+                  padding: '16px',
+                  background: 'white',
+                  border: '2px solid #e0e0e0',
+                  borderRadius: '12px',
+                  fontSize: '16px',
+                  fontWeight: '500',
+                  color: '#333',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '12px',
+                  transition: 'all 0.2s'
+                }}
+                onMouseOver={(e) => e.currentTarget.style.borderColor = '#667eea'}
+                onMouseOut={(e) => e.currentTarget.style.borderColor = '#e0e0e0'}
+              >
+                <div style={{ background: '#f0f4ff', padding: '8px', borderRadius: '50%', color: '#667eea' }}>
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                  </svg>
+                </div>
+                Add to Existing User
+              </button>
+
+              <button
+                onClick={() => {
+                  setShowAddUserChoice(false);
+                  setShowStudentForm(true);
+                }}
+                style={{
+                  padding: '16px',
+                  background: 'white',
+                  border: '2px solid #e0e0e0',
+                  borderRadius: '12px',
+                  fontSize: '16px',
+                  fontWeight: '500',
+                  color: '#333',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '12px',
+                  transition: 'all 0.2s'
+                }}
+                onMouseOver={(e) => e.currentTarget.style.borderColor = '#667eea'}
+                onMouseOut={(e) => e.currentTarget.style.borderColor = '#e0e0e0'}
+              >
+                <div style={{ background: '#f0f4ff', padding: '8px', borderRadius: '50%', color: '#667eea' }}>
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="8.5" cy="7" r="4"></circle>
+                    <line x1="20" y1="8" x2="20" y2="14"></line>
+                    <line x1="23" y1="11" x2="17" y2="11"></line>
+                  </svg>
+                </div>
+                Create New User
+              </button>
+
+              <button
+                onClick={() => setShowAddUserChoice(false)}
+                style={{
+                  padding: '12px',
+                  marginTop: '10px',
+                  background: 'none',
+                  border: 'none',
+                  color: '#666',
+                  cursor: 'pointer',
+                  textDecoration: 'underline'
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Existing User Select Modal */}
+      {showExistingUserSelect && (
+        <div className="popup-overlay" onClick={() => setShowExistingUserSelect(false)}>
+          <div className="popup-content" style={{ maxWidth: '600px', maxHeight: '80vh' }} onClick={(e) => e.stopPropagation()}>
+            <div className="popup-header">
+              <h3 className="popup-title">Select User</h3>
+              <input
+                type="text"
+                placeholder="Search by name or roll number..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                style={{
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  border: '1px solid #ddd',
+                  marginLeft: 'auto',
+                  width: '200px'
+                }}
+              />
+            </div>
+            <div style={{ padding: '20px', overflowY: 'auto', maxHeight: 'calc(80vh - 80px)' }}>
+              {(() => {
+                // Deduplicate users based on Roll Number or Email
+                const uniqueUsers = Array.from(new Map(savedUsers.map(user => [user.studentInfo?.rollNumber || user.id, user])).values());
+                const filteredUsers = uniqueUsers.filter(user =>
+                  (user.studentInfo?.name?.toLowerCase() || '').includes(searchTerm.toLowerCase()) ||
+                  (user.studentInfo?.rollNumber?.toLowerCase() || '').includes(searchTerm.toLowerCase())
+                );
+
+                return (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '10px' }}>
+                    {filteredUsers.map(user => (
+                      <div
+                        key={user.id}
+                        onClick={() => {
+                          setStudentInfo({
+                            ...studentInfo,
+                            name: user.studentInfo?.name || '',
+                            gender: user.studentInfo?.gender || '',
+                            email: user.studentInfo?.email || '',
+                            rollNumber: user.studentInfo?.rollNumber || '',
+                            department: user.studentInfo?.department || '',
+                            subject: '' // Reset subject as it's a new entry
+                          });
+                          setShowExistingUserSelect(false);
+                          setShowStudentForm(true);
+                        }}
+                        style={{
+                          padding: '12px 16px 12px 10px',
+                          border: '1px solid #e0e0e0',
+                          borderRadius: '8px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          transition: 'background 0.2s'
+                        }}
+                        onMouseOver={(e) => e.currentTarget.style.background = '#f8f9fa'}
+                        onMouseOut={(e) => e.currentTarget.style.background = 'white'}
+                      >
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <div style={{ fontWeight: '600', color: '#333', fontSize: '16px' }}>{user.studentInfo?.name || 'Unknown'}</div>
+                          <div style={{ fontSize: '14px', color: '#555' }}>{user.studentInfo?.department}</div>
+                          <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>{user.studentInfo?.rollNumber}</div>
+                        </div>
+                        <div style={{ color: '#667eea' }}>Select →</div>
+                      </div>
+                    ))}
+                    {filteredUsers.length === 0 && (
+                      <p style={{ textAlign: 'center', color: '#999', margin: '20px' }}>No users found.</p>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Track User Section */}
       {
         showTrackUser && (
@@ -1407,6 +1629,7 @@ function Dashboard() {
                         transition: 'transform 0.2s, box-shadow 0.2s',
                         cursor: 'pointer'
                       }}
+                        onClick={() => setSelectedTrackUser(user)}
                         onMouseEnter={(e) => {
                           e.currentTarget.style.transform = 'translateY(-4px)';
                           e.currentTarget.style.boxShadow = '0 4px 16px rgba(0,0,0,0.15)';
@@ -1507,6 +1730,133 @@ function Dashboard() {
         )
       }
 
+      {/* Track User Detail Modal */}
+      {selectedTrackUser && (
+        <div className="popup-overlay" onClick={() => setSelectedTrackUser(null)}>
+          <div className="popup-content" style={{ maxWidth: '900px', maxHeight: '90vh' }} onClick={(e) => e.stopPropagation()}>
+            <div className="popup-header" style={{ borderBottom: '1px solid #eee' }}>
+              <div>
+                <h2 className="popup-title" style={{ fontSize: '22px' }}>{selectedTrackUser.studentInfo?.name}</h2>
+                <p style={{ margin: '4px 0 0 0', color: '#666', fontSize: '14px' }}>
+                  {selectedTrackUser.studentInfo?.rollNumber} • {selectedTrackUser.studentInfo?.department}
+                </p>
+              </div>
+              <button
+                onClick={() => setSelectedTrackUser(null)}
+                style={{ background: 'none', border: 'none', fontSize: '24px', cursor: 'pointer', color: '#999' }}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="popup-form" style={{ padding: '30px' }}>
+              {(() => {
+                const userHistory = savedUsers.filter(u =>
+                  (u.studentInfo?.rollNumber === selectedTrackUser.studentInfo?.rollNumber && u.studentInfo?.rollNumber) ||
+                  (u.studentInfo?.email === selectedTrackUser.studentInfo?.email && u.studentInfo?.email)
+                ).sort((a, b) => b.timestamp.seconds - a.timestamp.seconds);
+
+                // Stats calculation
+                const totalSessions = userHistory.length;
+                const avgAttention = userHistory.reduce((acc, curr) => acc + (curr.analysisResults?.attentionScore || 0), 0) / totalSessions;
+                const avgEngagement = userHistory.reduce((acc, curr) => acc + (curr.analysisResults?.engagement?.confidence || 0), 0) / totalSessions;
+
+                // Subject Performance
+                const subjectStats = {};
+                userHistory.forEach(session => {
+                  const subject = session.studentInfo?.subject || 'Unspecified';
+                  if (!subjectStats[subject]) {
+                    subjectStats[subject] = { total: 0, count: 0 };
+                  }
+                  subjectStats[subject].total += session.analysisResults?.attentionScore || 0;
+                  subjectStats[subject].count += 1;
+                });
+
+                return (
+                  <div>
+                    {/* Key Stats Row */}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', marginBottom: '30px' }}>
+                      <div style={{ background: '#f8f9ff', padding: '20px', borderRadius: '12px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '32px', fontWeight: 'bold', color: '#667eea' }}>{(avgAttention * 100).toFixed(1)}%</div>
+                        <div style={{ color: '#666', fontSize: '14px', marginTop: '4px' }}>Avg. Attention Score</div>
+                      </div>
+                      <div style={{ background: '#f0fff4', padding: '20px', borderRadius: '12px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '32px', fontWeight: 'bold', color: '#48bb78' }}>{(avgEngagement * 100).toFixed(1)}%</div>
+                        <div style={{ color: '#666', fontSize: '14px', marginTop: '4px' }}>Avg. Engagement</div>
+                      </div>
+                      <div style={{ background: '#fff5f5', padding: '20px', borderRadius: '12px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '32px', fontWeight: 'bold', color: '#333' }}>{totalSessions}</div>
+                        <div style={{ color: '#666', fontSize: '14px', marginTop: '4px' }}>Total Sessions</div>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
+                      {/* Subject Performance */}
+                      <div>
+                        <h4 style={{ margin: '0 0 15px 0' }}>Subject Performance</h4>
+                        <div style={{ background: 'white', border: '1px solid #eee', borderRadius: '12px', padding: '20px' }}>
+                          {Object.entries(subjectStats).map(([subject, stats]) => {
+                            const score = (stats.total / stats.count) * 100;
+                            return (
+                              <div key={subject} style={{ marginBottom: '15px' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px', fontSize: '14px' }}>
+                                  <span>{subject}</span>
+                                  <span style={{ fontWeight: '500' }}>{score.toFixed(1)}%</span>
+                                </div>
+                                <div style={{ height: '8px', background: '#f0f0f0', borderRadius: '4px', overflow: 'hidden' }}>
+                                  <div style={{
+                                    height: '100%',
+                                    width: `${score}%`,
+                                    background: score > 75 ? '#48bb78' : score > 50 ? '#667eea' : '#f56565',
+                                    borderRadius: '4px'
+                                  }}></div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Recent History List */}
+                      <div>
+                        <h4 style={{ margin: '0 0 15px 0' }}>Recent History</h4>
+                        <div style={{ maxHeight: '300px', overflowY: 'auto', border: '1px solid #eee', borderRadius: '12px' }}>
+                          {userHistory.map((session, idx) => (
+                            <div key={idx} style={{
+                              padding: '15px',
+                              borderBottom: idx === userHistory.length - 1 ? 'none' : '1px solid #f5f5f5',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between'
+                            }}>
+                              <div>
+                                <div style={{ fontWeight: '500', color: '#333' }}>{session.studentInfo?.subject || 'General'}</div>
+                                <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>
+                                  {new Date(session.timestamp.seconds * 1000).toLocaleDateString()}
+                                </div>
+                              </div>
+                              <div style={{ textAlign: 'right' }}>
+                                <div style={{
+                                  fontWeight: 'bold',
+                                  color: (session.analysisResults?.attentionScore || 0) > 0.75 ? '#48bb78' : '#e53e3e'
+                                }}>
+                                  {((session.analysisResults?.attentionScore || 0) * 100).toFixed(0)}%
+                                </div>
+                                <div style={{ fontSize: '11px', color: '#999' }}>Attention</div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Profile Section */}
       {
         showProfile && (
@@ -1564,19 +1914,7 @@ function Dashboard() {
                         Cancel
                       </button>
                       <button
-                        onClick={() => {
-                          setIsEditingProfile(false);
-                          // Notification
-                          const notification = document.createElement('div');
-                          notification.textContent = 'Profile updated successfully!';
-                          notification.style.cssText = 'position: fixed; top: 80px; right: 20px; background: #4CAF50; color: white; padding: 16px 24px; borderRadius: 8px; boxShadow: 0 4px 12px rgba(0,0,0,0.15); zIndex: 10000; fontSize: 14px; fontWeight: 500;';
-                          document.body.appendChild(notification);
-                          setTimeout(() => {
-                            notification.style.transition = 'opacity 0.3s';
-                            notification.style.opacity = '0';
-                            setTimeout(() => notification.remove(), 300);
-                          }, 3000);
-                        }}
+                        onClick={handleSaveProfile}
                         style={{
                           background: '#000',
                           color: 'white',
