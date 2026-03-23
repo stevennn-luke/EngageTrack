@@ -16,7 +16,7 @@ class CompatibleBatchNormalization(tf.keras.layers.BatchNormalization):
         # Convert axis from list to int if needed
         if isinstance(axis, list):
             axis = axis[0] if len(axis) > 0 else -1
-        super().__init__(axis=axis, **kwargs)
+        super().__init__(axis=axis, **kwargs)  # type: ignore
     
     @classmethod
     def from_config(cls, config):
@@ -155,7 +155,7 @@ def process_video_file(video_bytes) -> np.ndarray:
         while len(frames) < NUM_FRAMES:
             frames.append(frames[-1])
         
-        video_array = np.array(frames[:NUM_FRAMES])
+        video_array = np.array(frames[:int(NUM_FRAMES)])
         return video_array
     
     finally:
@@ -176,6 +176,18 @@ async def predict_frame(file: UploadFile = File(...)):
                 'error': 'Invalid image',
                 'message': 'Could not decode image'
             }
+            
+        # Detect face for bounding box
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        
+        face_box = None
+        if len(faces) > 0:
+            # Get the largest face
+            largest_face = max(faces, key=lambda f: f[2] * f[3])
+            # convert numpy integer types to native python ints for JSON serialization
+            face_box = [int(largest_face[0]), int(largest_face[1]), int(largest_face[2]), int(largest_face[3])]
         
         # Process single frame - duplicate it to match NUM_FRAMES requirement
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -220,7 +232,8 @@ async def predict_frame(file: UploadFile = File(...)):
                 'probabilities': frustration_pred[0].tolist()
             },
             'attention_score': attention_score,
-            'model_type': 'real-time'
+            'model_type': 'real-time',
+            'face_box': face_box
         }
     
     except Exception as e:

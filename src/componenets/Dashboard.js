@@ -2,12 +2,15 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase/config';
-import { collection, addDoc, getDocs, doc, setDoc, getDoc } from 'firebase/firestore';
+import { collection, addDoc, getDocs, doc, setDoc, getDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 import logoWhite from '../assets/logo-white.png';
 import homeBg from '../assets/Home-Screen.png';
 import './Dashboard.css';
 import './DashboardRedesign.css';
 import RotatingTips from '../RotatingTips';
+import * as tf from '@tensorflow/tfjs';
+import * as blazeface from '@tensorflow-models/blazeface';
+
 // Google Cloud URL
 const API_BASE_URL = 'https://engagetrack-api-938727467811.asia-south1.run.app';
 
@@ -21,6 +24,17 @@ function Dashboard() {
   const [error, setError] = useState(null);
   const [cameraStream, setCameraStream] = useState(null);
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [faceBox, setFaceBox] = useState(null);
+  const faceModelRef = React.useRef(null);
+  
+  
+
+  const [lowAttentionAlert, setLowAttentionAlert] = useState(false);
+  const lowAttentionCountRef = React.useRef(0);
+  
+  const sessionLogRef = React.useRef({ isRecording: false, data: [] });
+  const [isRecordingSession, setIsRecordingSession] = useState(false);
+  const animationFrameRef = React.useRef(null);
   const [liveStats, setLiveStats] = useState(null);
   const [isLiveAnalyzing, setIsLiveAnalyzing] = useState(false);
 
@@ -47,6 +61,11 @@ function Dashboard() {
   const [showExistingUserSelect, setShowExistingUserSelect] = useState(false);
   const [selectedTrackUser, setSelectedTrackUser] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
+  // 3-dot menu
+  const [openMenuId, setOpenMenuId] = useState(null);
+  // Full card editing
+  const [editingCardId, setEditingCardId] = useState(null);
+  const [editingCardData, setEditingCardData] = useState({});
 
   // Profile section states
   const [showProfile, setShowProfile] = useState(false);
@@ -86,7 +105,6 @@ function Dashboard() {
               role: data.role || ''
             });
           } else {
-            // If no profile exists yet, use auth data
             setProfileData(prev => ({
               ...prev,
               name: currentUser.displayName || prev.name,
@@ -110,8 +128,81 @@ function Dashboard() {
       if (cameraStream) {
         cameraStream.getTracks().forEach(track => track.stop());
       }
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
     };
   }, [filePreview, cameraStream]);
+
+  useEffect(() => {
+    const loadFaceModel = async () => {
+      try {
+        await tf.ready();
+        faceModelRef.current = await blazeface.load();
+      } catch (e) {
+        console.error("Failed to load BlazeFace:", e);
+      }
+    };
+    loadFaceModel();
+  }, []);
+
+  const trackFace = async () => {
+    if (!videoRef.current || !faceModelRef.current || videoRef.current.readyState !== 4) return;
+    try {
+      const predictions = await faceModelRef.current.estimateFaces(videoRef.current, false);
+      if (predictions.length > 0) {
+        const start = predictions[0].topLeft;
+        const end = predictions[0].bottomRight;
+        const size = [end[0] - start[0], end[1] - start[1]];
+        const video = videoRef.current;
+        const scaleX = video.offsetWidth / video.videoWidth;
+        const scaleY = video.offsetHeight / video.videoHeight;
+        const newBox = {
+          x: start[0] * scaleX,
+          y: start[1] * scaleY,
+          width: size[0] * scaleX,
+          height: size[1] * scaleY
+        };
+        
+        setFaceBox(prev => {
+          if (!prev) return newBox;
+
+          const diffX = Math.abs(prev.x - newBox.x);
+          const diffY = Math.abs(prev.y - newBox.y);
+          const diffW = Math.abs(prev.width - newBox.width);
+          const diffH = Math.abs(prev.height - newBox.height);
+          
+          if (diffX > 5 || diffY > 5 || diffW > 5 || diffH > 5) {
+
+            return {
+              x: prev.x * 0.4 + newBox.x * 0.6,
+              y: prev.y * 0.4 + newBox.y * 0.6,
+              width: prev.width * 0.4 + newBox.width * 0.6,
+              height: prev.height * 0.4 + newBox.height * 0.6
+            };
+          }
+          return prev;
+        });
+      } else {
+        setFaceBox(null);
+      }
+    } catch(err) {}
+  };
+
+  useEffect(() => {
+    const loop = async () => {
+      if (isCameraActive) {
+        await trackFace();
+      } else {
+        setFaceBox(null);
+      }
+      animationFrameRef.current = requestAnimationFrame(loop);
+    };
+    loop();
+    return () => {
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    };
+  }, [isCameraActive]);
 
 
   useEffect(() => {
@@ -209,7 +300,6 @@ function Dashboard() {
       const frameDataUrl = captureFrame();
       if (!frameDataUrl) return;
 
-      // Convert data URL to blob
       const response = await fetch(frameDataUrl);
       const blob = await response.blob();
 
@@ -232,7 +322,26 @@ function Dashboard() {
         return;
       }
 
-      setLiveStats(results);
+
+      if (analysisIntervalRef.current) {
+        setLiveStats(results);
+        
+        if (results.attention_score < 0.3) {
+          lowAttentionCountRef.current += 1;
+          if (lowAttentionCountRef.current >= 3) {
+            setLowAttentionAlert(true);
+            setTimeout(() => setLowAttentionAlert(false), 4000);
+            lowAttentionCountRef.current = 0;
+          }
+        } else {
+          lowAttentionCountRef.current = 0;
+        }
+
+
+        if (sessionLogRef.current.isRecording) {
+           sessionLogRef.current.data.push({ timestamp: Date.now(), stats: results });
+        }
+      }
     } catch (err) {
       console.error('Frame analysis error:', err);
     }
@@ -242,7 +351,6 @@ function Dashboard() {
     if (analysisIntervalRef.current) return;
 
     setIsLiveAnalyzing(true);
-    // Resume video playback
     if (videoRef.current) {
       videoRef.current.play().catch(err => console.error('Video play error:', err));
     }
@@ -257,12 +365,52 @@ function Dashboard() {
       clearInterval(analysisIntervalRef.current);
       analysisIntervalRef.current = null;
     }
-    // Pause video playback
     if (videoRef.current) {
       videoRef.current.pause();
     }
     setIsLiveAnalyzing(false);
-    setLiveStats(null);
+  };
+
+  const toggleRecording = () => {
+    if (sessionLogRef.current.isRecording) {
+      sessionLogRef.current.isRecording = false;
+      setIsRecordingSession(false);
+      
+      const logs = sessionLogRef.current.data;
+      if (logs.length === 0) {
+        alert("No data recorded. Analysis needs to be running while recording.");
+        return;
+      }
+      
+      let b = 0, e_stat = 0, c = 0, f = 0, a = 0;
+      logs.forEach(log => {
+        b += log.stats.boredom.confidence;
+        e_stat += log.stats.engagement.confidence;
+        c += log.stats.confusion.confidence;
+        f += log.stats.frustration.confidence;
+        a += log.stats.attention_score;
+      });
+      
+      const len = logs.length;
+      const averagedResults = {
+        boredom: { confidence: b / len },
+        engagement: { confidence: e_stat / len },
+        confusion: { confidence: c / len },
+        frustration: { confidence: f / len },
+        attention_score: a / len
+      };
+      
+      setAnalysisResults(averagedResults);
+      setVideoEnded(true); 
+      stopCamera(); 
+      setAddUserStep('details'); 
+      setSelectedMode('upload');
+      setTimeout(() => alert("Session recorded successfully! Please enter student information to save the results."), 300);
+    } else {
+      sessionLogRef.current.isRecording = true;
+      sessionLogRef.current.data = [];
+      setIsRecordingSession(true);
+    }
   };
 
   const handleFileSelect = (e) => {
@@ -296,7 +444,6 @@ function Dashboard() {
     console.log('handleAnalyze called - selectedFile:', selectedFile?.name, 'selectedMode:', selectedMode, 'addUserStep:', addUserStep);
 
     if (selectedMode === 'live') {
-      // Start camera for live video
       await startCamera();
 
       setTimeout(() => {
@@ -305,8 +452,6 @@ function Dashboard() {
       return;
     }
 
-    // Handle upload mode
-    // Use the passed file if available (from auto-analyze), otherwise use state
     const fileToAnalyze = (fileOverride instanceof File) ? fileOverride : selectedFile;
 
     if (!fileToAnalyze) {
@@ -374,12 +519,11 @@ function Dashboard() {
     } catch (err) {
       console.error('Analysis error:', err);
       setError(err.message || 'Failed to analyze video. Please try again.');
-      setIsAnalyzing(false); // Stop analyzing on error
+      setIsAnalyzing(false);
     }
   };
 
   const handleSaveResults = async () => {
-    // 1. Check for basic input validity
     if (!studentInfo.name || !studentInfo.gender || !studentInfo.email || !studentInfo.rollNumber || !studentInfo.department) {
       setError('Please fill in all student information fields');
       return;
@@ -390,14 +534,12 @@ function Dashboard() {
       return;
     }
 
-    // 2. Check Authentication
     if (!currentUser) {
       setError('You must be logged in to save results.');
       console.error('Save failed: User not authenticated');
       return;
     }
 
-    // 3. Check Network Connectivity
     if (!navigator.onLine) {
       setError('You appear to be offline. Please check your internet connection.');
       return;
@@ -409,8 +551,6 @@ function Dashboard() {
     console.log('Attempting to save results for user:', currentUser.uid);
 
     try {
-      // Save to Firestore with timeout
-
       const savePromise = addDoc(collection(db, 'analysisResults'), {
         studentInfo: {
           name: studentInfo.name || '',
@@ -443,7 +583,6 @@ function Dashboard() {
       console.log('Document written with ID: ', docRef.id);
       setSaveSuccess(true);
 
-      // Show toast notification
       const notification = document.createElement('div');
       notification.textContent = 'User saved successfully!';
       notification.style.cssText = 'position: fixed; top: 80px; right: 20px; background: #4CAF50; color: white; padding: 16px 24px; borderRadius: 8px; boxShadow: 0 4px 12px rgba(0,0,0,0.15); zIndex: 10000; fontSize: 14px; fontWeight: 500;';
@@ -467,19 +606,26 @@ function Dashboard() {
   };
 
   const handleSaveProfile = async () => {
-    if (!currentUser) return;
+    if (!currentUser) {
+      alert('You must be logged in to save your profile.');
+      return;
+    }
 
     try {
-      await setDoc(doc(db, 'users', currentUser.uid), {
-        ...profileData,
+      const docRef = doc(db, 'users', currentUser.uid);
+      await setDoc(docRef, {
+        name: profileData.name || '',
+        email: profileData.email || '',
+        phone: profileData.phone || '',
+        department: profileData.department || '',
+        role: profileData.role || '',
         updatedAt: new Date()
       }, { merge: true });
 
       setIsEditingProfile(false);
 
-      // Show toast notification
       const notification = document.createElement('div');
-      notification.textContent = 'Profile updated successfully!';
+      notification.textContent = '✓ Profile saved successfully!';
       notification.style.cssText = 'position: fixed; top: 80px; right: 20px; background: #4CAF50; color: white; padding: 16px 24px; borderRadius: 8px; boxShadow: 0 4px 12px rgba(0,0,0,0.15); zIndex: 10000; fontSize: 14px; fontWeight: 500;';
       document.body.appendChild(notification);
       setTimeout(() => {
@@ -489,10 +635,71 @@ function Dashboard() {
       }, 3000);
 
     } catch (error) {
-      console.error("Error saving profile:", error);
-      setError("Failed to save profile changes.");
+      console.error('Error saving profile:', error);
+      alert(`Failed to save profile: ${error.message}`);
     }
   };
+
+  const handleSaveUserDetails = async (userId) => {
+    try {
+      const docRef = doc(db, 'analysisResults', userId);
+      await updateDoc(docRef, {
+        'studentInfo.name': editingCardData.name || '',
+        'studentInfo.rollNumber': editingCardData.rollNumber || '',
+        'studentInfo.department': editingCardData.department || '',
+        'studentInfo.email': editingCardData.email || '',
+        'studentInfo.subject': editingCardData.subject || '',
+        'studentInfo.gender': editingCardData.gender || ''
+      });
+      setSavedUsers(prev =>
+        prev.map(u => u.id === userId
+          ? { ...u, studentInfo: { ...u.studentInfo, ...editingCardData } }
+          : u
+        )
+      );
+      if (selectedTrackUser?.id === userId) {
+        setSelectedTrackUser(prev => ({ ...prev, studentInfo: { ...prev.studentInfo, ...editingCardData } }));
+      }
+      setEditingCardId(null);
+      setEditingCardData({});
+      const notification = document.createElement('div');
+      notification.textContent = '\u2713 Details updated successfully!';
+      notification.style.cssText = 'position: fixed; top: 80px; right: 20px; background: #4CAF50; color: white; padding: 16px 24px; borderRadius: 8px; boxShadow: 0 4px 12px rgba(0,0,0,0.15); zIndex: 10000; fontSize: 14px; fontWeight: 500;';
+      document.body.appendChild(notification);
+      setTimeout(() => {
+        notification.style.transition = 'opacity 0.3s';
+        notification.style.opacity = '0';
+        setTimeout(() => notification.remove(), 300);
+      }, 2500);
+    } catch (error) {
+      console.error('Error updating user details:', error);
+      alert(`Failed to update details: ${error.message}`);
+    }
+  };
+
+  const handleDeleteUser = async (userId, userName, e) => {
+    e.stopPropagation();
+    const confirmed = window.confirm(`Are you sure you want to delete "${userName || 'this user'}"? This cannot be undone.`);
+    if (!confirmed) return;
+    try {
+      await deleteDoc(doc(db, 'analysisResults', userId));
+      setSavedUsers(prev => prev.filter(u => u.id !== userId));
+      if (selectedTrackUser?.id === userId) setSelectedTrackUser(null);
+      const notification = document.createElement('div');
+      notification.textContent = 'User deleted successfully.';
+      notification.style.cssText = 'position: fixed; top: 80px; right: 20px; background: #e53e3e; color: white; padding: 16px 24px; borderRadius: 8px; boxShadow: 0 4px 12px rgba(0,0,0,0.15); zIndex: 10000; fontSize: 14px; fontWeight: 500;';
+      document.body.appendChild(notification);
+      setTimeout(() => {
+        notification.style.transition = 'opacity 0.3s';
+        notification.style.opacity = '0';
+        setTimeout(() => notification.remove(), 300);
+      }, 2500);
+    } catch (error) {
+      console.error('Error deleting user:', error);
+      alert(`Failed to delete user: ${error.message}`);
+    }
+  };
+
 
   const handleClosePopup = () => {
     if (filePreview && filePreview.startsWith('blob:')) {
@@ -626,7 +833,7 @@ function Dashboard() {
                   ) : (
                     <div className="live-analysis-container">
                       <div className="live-video-section">
-                        <div className="video-container">
+                        <div className="video-container" style={{ position: 'relative' }}>
                           <video
                             ref={videoRef}
                             className="live-video-preview"
@@ -637,6 +844,55 @@ function Dashboard() {
                               e.target.play().catch(err => console.error('Video play error:', err));
                             }}
                           />
+                          {faceBox && isCameraActive && (
+                            <div style={{
+                              position: 'absolute',
+                              border: '2px solid #55fc55',
+                              backgroundColor: 'rgba(85, 252, 85, 0.1)',
+                              borderRadius: '4px',
+                              left: `${faceBox.x}px`,
+                              top: `${faceBox.y}px`,
+                              width: `${faceBox.width}px`,
+                              height: `${faceBox.height}px`,
+                              pointerEvents: 'none',
+                              zIndex: 10
+                            }}>
+                              {liveStats && (
+                                <div style={{
+                                  position: 'absolute',
+                                  top: '-25px',
+                                  left: '-2px',
+                                  backgroundColor: '#55fc55',
+                                  color: '#000',
+                                  padding: '2px 8px',
+                                  borderRadius: '4px',
+                                  fontSize: '12px',
+                                  fontWeight: 'bold',
+                                  whiteSpace: 'nowrap'
+                                }}>
+                                  Attention Score: {(liveStats.attention_score * 100).toFixed(1)}%
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {lowAttentionAlert && isCameraActive && (
+                            <div style={{
+                              position: 'absolute',
+                              top: '20px',
+                              left: '50%',
+                              transform: 'translateX(-50%)',
+                              backgroundColor: 'rgba(239, 68, 68, 0.95)',
+                              color: 'white',
+                              padding: '12px 24px',
+                              borderRadius: '8px',
+                              zIndex: 100,
+                              fontWeight: '600',
+                              boxShadow: '0 4px 12px rgba(220, 38, 38, 0.4)',
+                              animation: 'pulse 1s infinite'
+                            }}>
+                              ⚠️ Sustained Low Attention Detected!
+                            </div>
+                          )}
                         </div>
                         <canvas ref={canvasRef} style={{ display: 'none' }} />
                       </div>
@@ -737,7 +993,7 @@ function Dashboard() {
                     </div>
                   )}
 
-                  <div className="form-actions">
+                  <div className="form-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: '15px' }}>
                     <button type="button" className="cancel-btn" onClick={handleClosePopup}>
                       Close
                     </button>
@@ -769,6 +1025,14 @@ function Dashboard() {
                             Resume Analysis
                           </button>
                         )}
+                        <button
+                          type="button"
+                          className="analyze-btn"
+                          onClick={toggleRecording}
+                          style={{ backgroundColor: isRecordingSession ? '#e53e3e' : '#667eea', color: 'white' }}
+                        >
+                          {isRecordingSession ? 'Stop Recording' : 'Record Session'}
+                        </button>
                       </>
                     )}
                   </div>
@@ -865,17 +1129,21 @@ function Dashboard() {
                               return;
                             }
                             setError(null);
-                            setAddUserStep('upload');
+                            
+                            if (analysisResults) {
+                               setAddUserStep('results');
+                            } else {
+                               setAddUserStep('upload');
+                            }
                           }}
                         >
-                          Upload Video
+                          {analysisResults ? 'View Aggregated Results' : 'Next: Upload Video'}
                         </button>
                       </div>
                     </>
                   )}
 
-
-                  {addUserStep !== 'details' && !selectedFile && (
+                  {addUserStep !== 'details' && !selectedFile && !analysisResults && (
                     <div className="file-upload-area">
                       <input
                         type="file"
@@ -1510,7 +1778,6 @@ function Dashboard() {
             </div>
             <div style={{ padding: '20px', overflowY: 'auto', maxHeight: 'calc(80vh - 80px)' }}>
               {(() => {
-                // Deduplicate users based on Roll Number or Email
                 const uniqueUsers = Array.from(new Map(savedUsers.map(user => [user.studentInfo?.rollNumber || user.id, user])).values());
                 const filteredUsers = uniqueUsers.filter(user =>
                   (user.studentInfo?.name?.toLowerCase() || '').includes(searchTerm.toLowerCase()) ||
@@ -1530,7 +1797,7 @@ function Dashboard() {
                             email: user.studentInfo?.email || '',
                             rollNumber: user.studentInfo?.rollNumber || '',
                             department: user.studentInfo?.department || '',
-                            subject: '' // Reset subject as it's a new entry
+                            subject: '' 
                           });
                           setShowExistingUserSelect(false);
                           setShowStudentForm(true);
@@ -1639,36 +1906,150 @@ function Dashboard() {
                           e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.1)';
                         }}
                       >
-                        {/* Student Info with Photo */}
-                        <div style={{ borderBottom: '1px solid #f0f0f0', paddingBottom: '15px', marginBottom: '15px' }}>
+                        {/* Student Info Header with 3-dot menu */}
+                        <div style={{ borderBottom: editingCardId === user.id ? 'none' : '1px solid #f0f0f0', paddingBottom: '15px', marginBottom: '15px' }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
-                            <h3 style={{ margin: '0', color: '#333', fontSize: '18px', flex: 1, textAlign: 'left' }}>
-                              {user.studentInfo?.name || 'Unknown'}
-                            </h3>
-                            {user.videoFileName && (
-                              <div style={{
-                                width: '60px',
-                                height: '60px',
-                                borderRadius: '8px',
-                                background: '#f0f0f0',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                marginLeft: '10px',
-                                overflow: 'hidden'
-                              }}>
-                                <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#999" strokeWidth="2">
-                                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
-                                  <circle cx="12" cy="13" r="4" />
-                                </svg>
+                            <div style={{ flex: 1, textAlign: 'left' }}>
+                              {editingCardId === user.id ? (
+                                <input
+                                  type="text"
+                                  value={editingCardData.name || ''}
+                                  onChange={e => { e.stopPropagation(); setEditingCardData(d => ({ ...d, name: e.target.value })); }}
+                                  onClick={e => e.stopPropagation()}
+                                  placeholder="Full name"
+                                  autoFocus
+                                  style={{
+                                    fontSize: '16px', fontWeight: '600', width: '100%',
+                                    border: '1px solid #667eea', borderRadius: '6px',
+                                    padding: '6px 10px', outline: 'none', boxSizing: 'border-box'
+                                  }}
+                                />
+                              ) : (
+                                <h3 style={{ margin: '0', color: '#333', fontSize: '18px' }}>
+                                  {user.studentInfo?.name || 'Unknown'}
+                                </h3>
+                              )}
+                            </div>
+
+                            {/* 3-dot menu */}
+                            <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+                              <button
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  setOpenMenuId(openMenuId === user.id ? null : user.id);
+                                }}
+                                style={{
+                                  background: 'none', border: 'none', cursor: 'pointer',
+                                  fontSize: '20px', color: '#999', padding: '0 4px',
+                                  lineHeight: 1, borderRadius: '4px'
+                                }}
+                                title="Options"
+                              >⋮</button>
+                              {openMenuId === user.id && (
+                                <div style={{
+                                  position: 'absolute', top: '24px', right: 0,
+                                  background: 'white', border: '1px solid #e0e0e0',
+                                  borderRadius: '8px', boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+                                  zIndex: 100, minWidth: '140px', overflow: 'hidden'
+                                }}>
+                                  <button
+                                    onClick={e => {
+                                      e.stopPropagation();
+                                      setOpenMenuId(null);
+                                      setEditingCardId(user.id);
+                                      setEditingCardData({
+                                        name: user.studentInfo?.name || '',
+                                        rollNumber: user.studentInfo?.rollNumber || '',
+                                        department: user.studentInfo?.department || '',
+                                        email: user.studentInfo?.email || '',
+                                        subject: user.studentInfo?.subject || '',
+                                        gender: user.studentInfo?.gender || ''
+                                      });
+                                    }}
+                                    style={{
+                                      width: '100%', padding: '10px 16px', background: 'none',
+                                      border: 'none', textAlign: 'left', cursor: 'pointer',
+                                      fontSize: '13px', color: '#333', display: 'flex',
+                                      alignItems: 'center', gap: '8px'
+                                    }}
+                                    onMouseOver={e => e.currentTarget.style.background = '#f5f5f5'}
+                                    onMouseOut={e => e.currentTarget.style.background = 'none'}
+                                  >
+                                    Edit
+                                  </button>
+                                  <div style={{ height: '1px', background: '#f0f0f0' }} />
+                                  <button
+                                    onClick={e => {
+                                      setOpenMenuId(null);
+                                      handleDeleteUser(user.id, user.studentInfo?.name, e);
+                                    }}
+                                    style={{
+                                      width: '100%', padding: '10px 16px', background: 'none',
+                                      border: 'none', textAlign: 'left', cursor: 'pointer',
+                                      fontSize: '13px', color: '#e53e3e', display: 'flex',
+                                      alignItems: 'center', gap: '8px'
+                                    }}
+                                    onMouseOver={e => e.currentTarget.style.background = '#fff5f5'}
+                                    onMouseOut={e => e.currentTarget.style.background = 'none'}
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Info fields — view or edit mode */}
+                          {editingCardId === user.id ? (
+                            <div onClick={e => e.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '10px' }}>
+                              {[
+                                { label: 'Roll No.', key: 'rollNumber', type: 'text', placeholder: 'e.g. CS2021001' },
+                                { label: 'Department', key: 'department', type: 'text', placeholder: 'e.g. Computer Science' },
+                                { label: 'Email', key: 'email', type: 'email', placeholder: 'student@email.com' },
+                                { label: 'Subject', key: 'subject', type: 'text', placeholder: 'e.g. Mathematics' }
+                              ].map(field => (
+                                <div key={field.key} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  <label style={{ fontSize: '12px', color: '#999', width: '80px', flexShrink: 0, textAlign: 'right' }}>{field.label}</label>
+                                  <input
+                                    type={field.type}
+                                    value={editingCardData[field.key] || ''}
+                                    onChange={e => setEditingCardData(d => ({ ...d, [field.key]: e.target.value }))}
+                                    placeholder={field.placeholder}
+                                    style={{
+                                      flex: 1, fontSize: '13px', border: '1px solid #ddd',
+                                      borderRadius: '6px', padding: '5px 8px', outline: 'none',
+                                      boxSizing: 'border-box'
+                                    }}
+                                    onFocus={e => e.target.style.borderColor = '#667eea'}
+                                    onBlur={e => e.target.style.borderColor = '#ddd'}
+                                  />
+                                </div>
+                              ))}
+                              <div style={{ display: 'flex', gap: '8px', marginTop: '6px', justifyContent: 'flex-end' }}>
+                                <button
+                                  onClick={() => { setEditingCardId(null); setEditingCardData({}); }}
+                                  style={{
+                                    padding: '6px 16px', background: '#f0f0f0', border: 'none',
+                                    borderRadius: '6px', cursor: 'pointer', fontSize: '13px', color: '#555'
+                                  }}
+                                >Cancel</button>
+                                <button
+                                  onClick={() => handleSaveUserDetails(user.id)}
+                                  style={{
+                                    padding: '6px 16px', background: '#667eea', color: 'white',
+                                    border: 'none', borderRadius: '6px', cursor: 'pointer',
+                                    fontSize: '13px', fontWeight: '500'
+                                  }}
+                                >Save</button>
                               </div>
-                            )}
-                          </div>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '13px', color: '#666', textAlign: 'left' }}>
-                            <div><strong>Roll:</strong> {user.studentInfo?.rollNumber || 'N/A'}</div>
-                            <div><strong>Department:</strong> {user.studentInfo?.department || 'N/A'}</div>
-                            <div><strong>Email:</strong> {user.studentInfo?.email || 'N/A'}</div>
-                          </div>
+                            </div>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '13px', color: '#666', textAlign: 'left' }}>
+                              <div><strong>Roll:</strong> {user.studentInfo?.rollNumber || 'N/A'}</div>
+                              <div><strong>Department:</strong> {user.studentInfo?.department || 'N/A'}</div>
+                              <div><strong>Email:</strong> {user.studentInfo?.email || 'N/A'}</div>
+                            </div>
+                          )}
                         </div>
 
                         {/* Analysis Stats */}
@@ -1717,7 +2098,7 @@ function Dashboard() {
                         </div>
 
                         {/* Timestamp */}
-                        <div style={{ marginTop: '12px', fontSize: '11px', color: '#999', textAlign: 'center' }}>
+                        <div style={{ marginTop: '12px', fontSize: '11px', color: '#999', textAlign: 'left' }}>
                           {user.timestamp ? new Date(user.timestamp.seconds * 1000).toLocaleString() : 'Unknown date'}
                         </div>
                       </div>
