@@ -1,313 +1,331 @@
+"""
+EngageTrack API – MobileNetV2 + StudentAttentionModelV4 pipeline
+──────────────────────────────────────────────────────────────────
+"""
+
 import os
 import tempfile
 import numpy as np
 import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import torchvision.transforms as T
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import tensorflow as tf
 from google.cloud import storage
 
-class CompatibleBatchNormalization(tf.keras.layers.BatchNormalization):
-    """Custom BatchNormalization layer that handles axis as list or int"""
-    
-    def __init__(self, axis=-1, **kwargs):
-        # Convert axis from list to int if needed
-        if isinstance(axis, list):
-            axis = axis[0] if len(axis) > 0 else -1
-        super().__init__(axis=axis, **kwargs)  # type: ignore
-    
-    @classmethod
-    def from_config(cls, config):
-        # Convert axis from list to int before calling parent from_config
-        if 'axis' in config and isinstance(config['axis'], list):
-            config = config.copy()  # Don't modify the original
-            config['axis'] = config['axis'][0] if len(config['axis']) > 0 else -1
-        return cls(**config)
-    
-    def get_config(self):
-        config = super().get_config()
-        # Ensure axis is always an int in the config
-        if isinstance(config.get('axis'), list):
-            config['axis'] = config['axis'][0] if len(config['axis']) > 0 else -1
-        return config
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+NUM_SEGMENTS    = 30
+FRAMES_PER_SEG  = 1
+FRAME_SIZE      = 224
+NUM_CLASSES     = 4
+CLASS_NAMES     = ['Disengage', 'Highly Disengage', 'Engage', 'Highly Engage']
+
+CNN_MODEL     = None
+STUDENT_MODEL = None
+
+TRANSFORM = T.Compose([
+    T.ToPILImage(), T.Resize((224,224)), T.ToTensor(),
+    T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Definitions
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FeatureProjector(nn.Module):
+    def __init__(self, inp, emb, drop):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(inp, emb*2), nn.LayerNorm(emb*2), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(emb*2, emb), nn.LayerNorm(emb), nn.GELU()
+        )
+    def forward(self, x):
+        B,T,D = x.shape
+        return self.net(x.reshape(B*T,D)).reshape(B,T,-1)
+
+class AttentionPooling(nn.Module):
+    def __init__(self, h):
+        super().__init__()
+        self.attn = nn.Sequential(nn.Linear(h,64), nn.Tanh(), nn.Linear(64,1))
+    def forward(self, x):
+        return (x * torch.softmax(self.attn(x), dim=1)).sum(dim=1)
+
+class StudentAttentionModelV4(nn.Module):
+    def __init__(self, inp, hid, layers, nc, drop):
+        super().__init__()
+        self.projector  = FeatureProjector(inp, hid, drop)
+        self.lstm       = nn.LSTM(hid, hid, layers, batch_first=True,
+                                  bidirectional=True, dropout=drop if layers>1 else 0.)
+        self.attention  = AttentionPooling(hid*2)
+        self.classifier = nn.Sequential(
+            nn.Linear(hid*2, hid), nn.GELU(), nn.Dropout(drop), nn.Linear(hid, nc)
+        )
+    def forward(self, x):
+        x, _ = self.lstm(self.projector(x))
+        return self.classifier(self.attention(x))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GCS helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _download_from_gcs(bucket_name: str, blob_name: str, local_path: str):
+    print(f"⬇  Downloading gs://{bucket_name}/{blob_name} → {local_path}")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    client = storage.Client()
+    client.bucket(bucket_name).blob(blob_name).download_to_filename(local_path)
+    print(f"✅ Downloaded {blob_name}")
 
 
-app = FastAPI()
+def _ensure_file(env_key: str, default_local: str, gcs_blob: str) -> str:
+    path   = os.environ.get(env_key, default_local)
+    bucket = os.environ.get("GCS_BUCKET_NAME", "ngagetrack-models")
+    if not os.path.exists(path):
+        _download_from_gcs(bucket, gcs_blob, path)
+    return path
 
-origins = ["*"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_models():
+    global CNN_MODEL, STUDENT_MODEL
+    if CNN_MODEL is not None and STUDENT_MODEL is not None:
+        return
+
+    device = torch.device("cpu")
+
+    print("Loading MobileNetV2 backbone …")
+    backbone = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+    cnn = nn.Sequential(backbone.features, nn.AdaptiveAvgPool2d((1,1))).to(device).eval()
+    CNN_MODEL = cnn
+    print("✅ MobileNetV2 loaded")
+
+    student_path = _ensure_file(
+        "STUDENT_LOCAL_PATH",
+        "/app/models/v4_student_attention_best.pt",
+        "v4_student_attention_best.pt",
+    )
+    print("Loading StudentAttentionModelV4 …")
+    
+    # Initialize architecture
+    HIDDEN = 256
+    LAYERS = 2
+    DROPOUT = 0.0
+    model = StudentAttentionModelV4(1280, HIDDEN, LAYERS, NUM_CLASSES, DROPOUT).to(device)
+    
+    ckpt = torch.load(student_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    
+    STUDENT_MODEL = model
+    print("✅ StudentAttentionModel loaded")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Video / frame preprocessing utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _crop_face(frames: list[np.ndarray]) -> list[np.ndarray]:
+    if not frames:
+        return frames
+
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    
+    gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
+    if len(faces) == 0:
+        return frames
+
+    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+    px = int(fw * 0.2)
+    py = int(fh * 0.2)
+    h, w = frames[0].shape[:2]
+
+    new_fx = max(0, fx - px)
+    new_fy = max(0, fy - py)
+    new_fw = min(w - new_fx, fw + 2 * px)
+    new_fh = min(h - new_fy, fh + 2 * py)
+
+    cropped_frames = []
+    for frame in frames:
+        cropped = frame[new_fy:new_fy+new_fh, new_fx:new_fx+new_fw]
+        cropped_frames.append(cropped)
+    return cropped_frames
+
+def _extract_frames_from_video(video_bytes: bytes) -> list[np.ndarray]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+    try:
+        cap   = cv2.VideoCapture(tmp_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total == 0:
+            raise ValueError("Video has no frames")
+        target = NUM_SEGMENTS * FRAMES_PER_SEG
+        indices = np.linspace(0, total - 1, target, dtype=int)
+        frames  = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if ret:
+                frames.append(frame)
+            elif frames:
+                frames.append(frames[-1])
+            else:
+                raise ValueError(f"Could not read frame {idx}")
+        cap.release()
+        while len(frames) < target:
+            frames.append(frames[-1])
+        return frames[:target]
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+def _frames_to_embeddings(frames: list) -> torch.Tensor:
+    try:
+        cnn = app.state.cnn_model
+    except Exception:
+        cnn = CNN_MODEL
+
+    embeddings = []
+    device = torch.device("cpu")
+    for frame in frames:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = TRANSFORM(rgb).unsqueeze(0).to(device)
+        with torch.no_grad():
+            emb = cnn(img).view(1, -1)
+        embeddings.append(emb)
+    return torch.stack(embeddings, dim=1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="EngageTrack API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MODEL = None
 
-NUM_FRAMES = 10
-FRAME_HEIGHT = 224
-FRAME_WIDTH = 224
+@app.on_event("startup")
+def startup_event():
+    load_models()
+    app.state.cnn_model     = CNN_MODEL
+    app.state.student_model = STUDENT_MODEL
+    print("✅ Models attached to app.state — worker ready.")
 
-def load_model():
-    """Load the TensorFlow model (lazy loading)"""
-    global MODEL
-    if MODEL is None:
-        try:
-            print("="*50)
-            print("Loading attention detection model...")
-            
-            # Configure TensorFlow threading
-            tf.config.threading.set_inter_op_parallelism_threads(1)
-            tf.config.threading.set_intra_op_parallelism_threads(1)
-            
-            # Determine model path
-            model_local_path_env = os.environ.get("MODEL_LOCAL_PATH")
-            if model_local_path_env:
-                model_path = model_local_path_env
-            else:
-                model_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
-                    "saved_models", "1", "model.h5"
-                )
-            
-            print(f"Model path: {model_path}")
-            
-            # Check if model exists locally, if not try to download from GCS
-            if not os.path.exists(model_path):
-                print(f"Model not found at {model_path}")
-                bucket_name = os.environ.get("GCS_BUCKET_NAME")
-                blob_name = os.environ.get("GCS_MODEL_BLOB", "model.h5")
-                
-                if bucket_name:
-                    print(f"Attempting to download from GCS bucket: {bucket_name}, blob: {blob_name}")
-                    try:
-                        # Ensure directory exists
-                        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-                        
-                        client = storage.Client()
-                        bucket = client.bucket(bucket_name)
-                        blob = bucket.blob(blob_name)
-                        blob.download_to_filename(model_path)
-                        print("✓ Model downloaded from GCS successfully!")
-                    except Exception as e:
-                        print(f"✗ ERROR downloading from GCS: {str(e)}")
-                        # Don't raise here, let the load_model fail normally if file still missing
-                else:
-                    print("! GCS_BUCKET_NAME environment variable not set. Skipping GCS download.")
-            
-            print(f"File exists: {os.path.exists(model_path)}")
-            
-            # Load the model (should work now that it's been fixed)
-            MODEL = tf.keras.models.load_model(model_path, compile=False)
-            
-            print("✓ Model loaded successfully!")
-            print(f"Model has {len(MODEL.layers)} layers")
-            print("="*50)
-            
-        except Exception as e:
-            print(f"✗ ERROR loading model: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise RuntimeError(f"Failed to load model: {str(e)}")
-    
-    return MODEL
 
 @app.get("/ping")
 async def ping():
-    return "Hello, I am alive"
+    return {"status": "alive", "version": "v4-mobilenet"}
 
-def process_video_file(video_bytes) -> np.ndarray:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.avi') as tmp_file:
-        tmp_file.write(video_bytes)
-        tmp_file_path = tmp_file.name
-    
-    try:
-        cap = cv2.VideoCapture(tmp_file_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if total_frames == 0:
-            raise ValueError("Could not read video or video has no frames")
-        
-        frame_indices = np.linspace(0, total_frames - 1, NUM_FRAMES, dtype=int)
-        frames = []
-        
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            
-            if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_resized = cv2.resize(frame_rgb, (FRAME_WIDTH, FRAME_HEIGHT))
-                frame_normalized = frame_resized.astype(np.float32) / 255.0
-                frames.append(frame_normalized)
-            else:
-                if len(frames) > 0:
-                    frames.append(frames[-1])
-                else:
-                    raise ValueError(f"Failed to read frame at index {idx}")
-        
-        cap.release()
-        
-        while len(frames) < NUM_FRAMES:
-            frames.append(frames[-1])
-        
-        video_array = np.array(frames[:int(NUM_FRAMES)])
-        return video_array
-    
-    finally:
-        if os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
-
-@app.post("/predict_frame")
-async def predict_frame(file: UploadFile = File(...)):
-    """Predict from a single frame for real-time analysis"""
-    try:
-        # Read the image
-        image_bytes = await file.read()
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return {
-                'error': 'Invalid image',
-                'message': 'Could not decode image'
-            }
-            
-        # Detect face for bounding box
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        
-        face_box = None
-        if len(faces) > 0:
-            # Get the largest face
-            largest_face = max(faces, key=lambda f: f[2] * f[3])
-            # convert numpy integer types to native python ints for JSON serialization
-            face_box = [int(largest_face[0]), int(largest_face[1]), int(largest_face[2]), int(largest_face[3])]
-        
-        # Process single frame - duplicate it to match NUM_FRAMES requirement
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_resized = cv2.resize(frame_rgb, (FRAME_WIDTH, FRAME_HEIGHT))
-        frame_normalized = frame_resized.astype(np.float32) / 255.0
-        
-        # Create a sequence by duplicating the frame
-        frames = [frame_normalized] * NUM_FRAMES
-        video_array = np.array(frames)
-        video_batch = np.expand_dims(video_array, 0)
-        
-        model = load_model()
-        predictions = model.predict(video_batch, verbose=0)
-        
-        boredom_pred, engagement_pred, confusion_pred, frustration_pred, attention_pred = predictions
-        
-        boredom_level = int(np.argmax(boredom_pred[0]))
-        engagement_level = int(np.argmax(engagement_pred[0]))
-        confusion_level = int(np.argmax(confusion_pred[0]))
-        frustration_level = int(np.argmax(frustration_pred[0]))
-        attention_score = float(attention_pred[0][0])
-        
-        return {
-            'boredom': {
-                'level': boredom_level,
-                'confidence': float(np.max(boredom_pred[0])),
-                'probabilities': boredom_pred[0].tolist()
-            },
-            'engagement': {
-                'level': engagement_level,
-                'confidence': float(np.max(engagement_pred[0])),
-                'probabilities': engagement_pred[0].tolist()
-            },
-            'confusion': {
-                'level': confusion_level,
-                'confidence': float(np.max(confusion_pred[0])),
-                'probabilities': confusion_pred[0].tolist()
-            },
-            'frustration': {
-                'level': frustration_level,
-                'confidence': float(np.max(frustration_pred[0])),
-                'probabilities': frustration_pred[0].tolist()
-            },
-            'attention_score': attention_score,
-            'model_type': 'real-time',
-            'face_box': face_box
-        }
-    
-    except Exception as e:
-        import traceback
-        return {
-            'error': str(e),
-            'message': 'Failed to process frame',
-            'traceback': traceback.format_exc()
-        }
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        if not file.filename.lower().endswith(('.mp4', '.avi')):
-            return {
-                'error': 'Invalid file type',
-                'message': 'Please upload either an MP4 or AVI video file'
-            }
-            
+        if not file.filename.lower().endswith((".mp4", ".avi", ".mov")):
+            return {"error": "Invalid file type", "message": "Upload an MP4, AVI, or MOV file"}
+
+        student = app.state.student_model
         video_bytes = await file.read()
-        video_frames = process_video_file(video_bytes)
-        video_batch = np.expand_dims(video_frames, 0)
-        
-        model = load_model()
-        predictions = model.predict(video_batch)
-        
-        boredom_pred, engagement_pred, confusion_pred, frustration_pred, attention_pred = predictions
-        
-        boredom_level = int(np.argmax(boredom_pred[0]))
-        engagement_level = int(np.argmax(engagement_pred[0]))
-        confusion_level = int(np.argmax(confusion_pred[0]))
-        frustration_level = int(np.argmax(frustration_pred[0]))
-        attention_score = float(attention_pred[0][0])
-        
+        frames      = _extract_frames_from_video(video_bytes)
+        frames      = _crop_face(frames)
+        seq         = _frames_to_embeddings(frames)
+
+        with torch.no_grad():
+            logits = student(seq)
+            probs  = torch.softmax(logits, dim=-1)[0].tolist()
+
+        pred_idx  = int(np.argmax(probs))
         return {
-            'boredom': {
-                'level': boredom_level,
-                'confidence': float(np.max(boredom_pred[0])),
-                'probabilities': boredom_pred[0].tolist()
+            "engagement": {
+                "level":       pred_idx,
+                "label":       CLASS_NAMES[pred_idx],
+                "confidence":  round(probs[pred_idx], 4),
+                "probabilities": {
+                    CLASS_NAMES[i]: round(probs[i], 4) for i in range(NUM_CLASSES)
+                },
             },
-            'engagement': {
-                'level': engagement_level,
-                'confidence': float(np.max(engagement_pred[0])),
-                'probabilities': engagement_pred[0].tolist()
-            },
-            'confusion': {
-                'level': confusion_level,
-                'confidence': float(np.max(confusion_pred[0])),
-                'probabilities': confusion_pred[0].tolist()
-            },
-            'frustration': {
-                'level': frustration_level,
-                'confidence': float(np.max(frustration_pred[0])),
-                'probabilities': frustration_pred[0].tolist()
-            },
-            'attention_score': attention_score,
-            'frames_processed': NUM_FRAMES,
-            'model_type': 'original',
-            'model_info': {
-                'total_params': 51608529,
-                'model_size_mb': 196.87,
-                'architecture': 'CNN + LSTM + Dense layers'
-            }
+            "frames_processed": NUM_SEGMENTS * FRAMES_PER_SEG,
+            "model_type": "mobilenetv2+student_attention_v4",
         }
-    
+
     except Exception as e:
         import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+@app.post("/predict_frame")
+async def predict_frame(file: UploadFile = File(...)):
+    try:
+        student = app.state.student_model
+
+        image_bytes = await file.read()
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return {"error": "Invalid image", "message": "Could not decode image"}
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        faces    = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
+        face_box = None
+        if len(faces) > 0:
+            fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            face_box = [int(fx), int(fy), int(fw), int(fh)]
+            
+            px, py = int(fw * 0.2), int(fh * 0.2)
+            h, w = frame.shape[:2]
+            n_fx = max(0, fx - px)
+            n_fy = max(0, fy - py)
+            n_fw = min(w - n_fx, fw + 2 * px)
+            n_fh = min(h - n_fy, fh + 2 * py)
+            frame = frame[n_fy:n_fy+n_fh, n_fx:n_fx+n_fw]
+
+        frames = [frame] * (NUM_SEGMENTS * FRAMES_PER_SEG)
+        seq    = _frames_to_embeddings(frames)
+
+        with torch.no_grad():
+            logits = student(seq)
+            probs  = torch.softmax(logits, dim=-1)[0].tolist()
+
+        pred_idx = int(np.argmax(probs))
         return {
-            'error': str(e),
-            'message': 'Failed to process video file',
-            'traceback': traceback.format_exc()
+            "engagement": {
+                "level":        pred_idx,
+                "label":        CLASS_NAMES[pred_idx],
+                "confidence":   round(probs[pred_idx], 4),
+                "probabilities": {
+                    CLASS_NAMES[i]: round(probs[i], 4) for i in range(NUM_CLASSES)
+                },
+            },
+            "face_box":   face_box,
+            "model_type": "mobilenetv2+student_attention_v4",
         }
+
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, workers=1, loop="asyncio")
-
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, workers=1)

@@ -1,14 +1,23 @@
-# Core API dependencies
+# Core API
 fastapi
 uvicorn
 python-multipart
-
-# ML dependencies
-tensorflow-cpu==2.15.0
-numpy
-opencv-python-headless>=4.10.0.84
-h5py
-requests
 pydantic
 starlette
+requests
+
+# Core ML + Vision dependencies
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Strongly pin numpy<2 first, before anything else resolves
+numpy==1.26.4
+
+# PyTorch CPU builds
+torch==2.2.2
+torchvision==0.17.2
+
+# Vision / video
+opencv-python-headless>=4.10.0.84
+
+# GCP
 google-cloud-storage

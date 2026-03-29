@@ -326,7 +326,7 @@ function Dashboard() {
       if (analysisIntervalRef.current) {
         setLiveStats(results);
         
-        if (results.attention_score < 0.3) {
+        if (results.engagement && results.engagement.level <= 1) {
           lowAttentionCountRef.current += 1;
           if (lowAttentionCountRef.current >= 3) {
             setLowAttentionAlert(true);
@@ -382,22 +382,39 @@ function Dashboard() {
         return;
       }
       
-      let b = 0, e_stat = 0, c = 0, f = 0, a = 0;
+      let votes = { 'Disengage': 0, 'Highly Disengage': 0, 'Engage': 0, 'Highly Engage': 0 };
+      let probSums = { 'Disengage': 0, 'Highly Disengage': 0, 'Engage': 0, 'Highly Engage': 0 };
+      let totalConfidence = 0;
+
       logs.forEach(log => {
-        b += log.stats.boredom.confidence;
-        e_stat += log.stats.engagement.confidence;
-        c += log.stats.confusion.confidence;
-        f += log.stats.frustration.confidence;
-        a += log.stats.attention_score;
+        const eng = log.stats.engagement;
+        if (eng) {
+          votes[eng.label] = (votes[eng.label] || 0) + 1;
+          probSums['Disengage'] += eng.probabilities['Disengage'] || 0;
+          probSums['Highly Disengage'] += eng.probabilities['Highly Disengage'] || 0;
+          probSums['Engage'] += eng.probabilities['Engage'] || 0;
+          probSums['Highly Engage'] += eng.probabilities['Highly Engage'] || 0;
+          totalConfidence += eng.confidence;
+        }
       });
       
       const len = logs.length;
+      const dominantLabel = Object.keys(votes).reduce((a, b) => votes[a] > votes[b] ? a : b);
+      const levelMap = { 'Disengage': 0, 'Highly Disengage': 1, 'Engage': 2, 'Highly Engage': 3 };
+
       const averagedResults = {
-        boredom: { confidence: b / len },
-        engagement: { confidence: e_stat / len },
-        confusion: { confidence: c / len },
-        frustration: { confidence: f / len },
-        attention_score: a / len
+        engagement: {
+          label: dominantLabel,
+          level: levelMap[dominantLabel],
+          confidence: totalConfidence / len,
+          probabilities: {
+            'Disengage': probSums['Disengage'] / len,
+            'Highly Disengage': probSums['Highly Disengage'] / len,
+            'Engage': probSums['Engage'] / len,
+            'Highly Engage': probSums['Highly Engage'] / len
+          }
+        },
+        frames_processed: logs.reduce((sum, log) => sum + (log.stats.frames_processed || 0), 0) / len
       };
       
       setAnalysisResults(averagedResults);
@@ -561,13 +578,12 @@ function Dashboard() {
           subject: studentInfo.subject || ''
         },
         analysisResults: {
-          boredom: analysisResults.boredom || { confidence: 0 },
-          engagement: analysisResults.engagement || { confidence: 0 },
-          confusion: analysisResults.confusion || { confidence: 0 },
-          frustration: analysisResults.frustration || { confidence: 0 },
-          attentionScore: typeof analysisResults.attention_score === 'number' ? analysisResults.attention_score : 0,
-          framesProcessed: analysisResults.frames_processed || 10,
-          modelType: analysisResults.model_type || 'CNN-LSTM'
+          engagementLevel: analysisResults.engagement?.level || 0,
+          engagementLabel: analysisResults.engagement?.label || 'Unknown',
+          engagementConfidence: analysisResults.engagement?.confidence || 0,
+          engagementProbabilities: analysisResults.engagement?.probabilities || {},
+          framesProcessed: analysisResults.frames_processed || 30,
+          modelType: analysisResults.model_type || 'i3d+student_attention_v3'
         },
         userId: currentUser.uid,
         timestamp: new Date(),
@@ -870,7 +886,7 @@ function Dashboard() {
                                   fontWeight: 'bold',
                                   whiteSpace: 'nowrap'
                                 }}>
-                                  Attention Score: {(liveStats.attention_score * 100).toFixed(1)}%
+                                  Attention Score: {((liveStats.engagement.probabilities['Engage'] + liveStats.engagement.probabilities['Highly Engage']) * 100).toFixed(1)}%
                                 </div>
                               )}
                             </div>
@@ -946,38 +962,41 @@ function Dashboard() {
                           <>
                             <h3 className="stats-title">Real-Time Analysis</h3>
                             <div className="live-stats-list">
-                              <div className="live-stat-item">
-                                <div className="stat-label">Boredom</div>
-                                <div className="stat-value">
-                                  {liveStats ? (liveStats.boredom.confidence * 100).toFixed(1) : '0.0'}%
+                              <div className="live-stat-item" style={{ borderBottom: '1px solid #eee', paddingBottom: '12px', marginBottom: '12px' }}>
+                                <div className="stat-label">Engagement State</div>
+                                <div className="stat-value" style={{
+                                  color: liveStats?.engagement?.level >= 2 ? '#4CAF50' : '#F44336',
+                                  fontWeight: 'bold', fontSize: '16px'
+                                }}>
+                                  {liveStats ? liveStats.engagement.label : '--'}
                                 </div>
                               </div>
 
                               <div className="live-stat-item">
-                                <div className="stat-label">Engagement</div>
+                                <div className="stat-label">Disengage</div>
                                 <div className="stat-value">
-                                  {liveStats ? (liveStats.engagement.confidence * 100).toFixed(1) : '0.0'}%
+                                  {liveStats ? (liveStats.engagement.probabilities['Disengage'] * 100).toFixed(1) : '0.0'}%
                                 </div>
                               </div>
 
                               <div className="live-stat-item">
-                                <div className="stat-label">Confusion</div>
+                                <div className="stat-label">Highly Disengage</div>
                                 <div className="stat-value">
-                                  {liveStats ? (liveStats.confusion.confidence * 100).toFixed(1) : '0.0'}%
+                                  {liveStats ? (liveStats.engagement.probabilities['Highly Disengage'] * 100).toFixed(1) : '0.0'}%
                                 </div>
                               </div>
 
                               <div className="live-stat-item">
-                                <div className="stat-label">Frustration</div>
+                                <div className="stat-label">Engage</div>
                                 <div className="stat-value">
-                                  {liveStats ? (liveStats.frustration.confidence * 100).toFixed(1) : '0.0'}%
+                                  {liveStats ? (liveStats.engagement.probabilities['Engage'] * 100).toFixed(1) : '0.0'}%
                                 </div>
                               </div>
 
-                              <div className="attention-score">
-                                <div className="stat-label">Attention Score</div>
-                                <div className="stat-value stat-large">
-                                  {liveStats ? (liveStats.attention_score * 100).toFixed(1) : '0.0'}%
+                              <div className="live-stat-item">
+                                <div className="stat-label">Highly Engage</div>
+                                <div className="stat-value">
+                                  {liveStats ? (liveStats.engagement.probabilities['Highly Engage'] * 100).toFixed(1) : '0.0'}%
                                 </div>
                               </div>
                             </div>
@@ -1129,7 +1148,7 @@ function Dashboard() {
                               return;
                             }
                             setError(null);
-                            
+
                             if (analysisResults) {
                                setAddUserStep('results');
                             } else {
@@ -1305,23 +1324,26 @@ function Dashboard() {
                         {/* Attendance Opinion - Placed below video */}
                         <div className="attendance-summary" style={{ marginTop: '20px' }}>
                           {(() => {
-                            const score = analysisResults.attention_score * 100;
-                            let status = '';
-                            let color = '';
-                            let message = '';
+                            let status, color, message;
+                            // Uses index: 0=Disengage, 1=Highly Disengage, 2=Engage, 3=Highly Engage
+                            const lvl = analysisResults.engagement.level;
 
-                            if (score >= 75) {
-                              status = 'Present';
+                            if (lvl === 3) {
+                              status = 'Excellent';
                               color = '#4CAF50';
-                              message = 'Student is highly engaged. Recommended for full attendance.';
-                            } else if (score >= 50) {
-                              status = 'Maybe';
-                              color = '#FF9800';
-                              message = 'Moderate engagement detected. Monitor for improvement.';
+                              message = 'Student was highly engaged. Recommended for full attendance.';
+                            } else if (lvl === 2) {
+                              status = 'Present';
+                              color = '#8BC34A';
+                              message = 'Moderate/good engagement detected. Present.';
+                            } else if (lvl === 1) {
+                              status = 'Alert';
+                              color = '#F44336';
+                              message = 'Student appeared highly disengaged or frustrated.';
                             } else {
                               status = 'Warning';
-                              color = '#F44336';
-                              message = 'Low attention detected. Intervention or inquiry recommended.';
+                              color = '#FF9800';
+                              message = 'Student appeared disengaged. Monitor for improvement.';
                             }
 
                             return (
@@ -1338,38 +1360,41 @@ function Dashboard() {
                       <div className="live-stats-section">
                         <h3 className="stats-title">Analysis Results</h3>
                         <div className="live-stats-list">
-                          <div className="live-stat-item">
-                            <div className="stat-label">Boredom</div>
-                            <div className="stat-value">
-                              {(analysisResults.boredom.confidence * 100).toFixed(1)}%
+                          <div className="live-stat-item" style={{ borderBottom: '1px solid #eee', paddingBottom: '12px', marginBottom: '12px' }}>
+                            <div className="stat-label">Engagement State</div>
+                            <div className="stat-value" style={{ 
+                              color: analysisResults.engagement.level >= 2 ? '#4CAF50' : '#F44336',
+                              fontWeight: 'bold', fontSize: '16px' 
+                            }}>
+                              {analysisResults.engagement.label}
                             </div>
                           </div>
 
                           <div className="live-stat-item">
-                            <div className="stat-label">Engagement</div>
+                            <div className="stat-label">Disengage</div>
                             <div className="stat-value">
-                              {(analysisResults.engagement.confidence * 100).toFixed(1)}%
+                              {(analysisResults.engagement.probabilities['Disengage'] * 100).toFixed(1)}%
                             </div>
                           </div>
 
                           <div className="live-stat-item">
-                            <div className="stat-label">Confusion</div>
+                            <div className="stat-label">Highly Disengage</div>
                             <div className="stat-value">
-                              {(analysisResults.confusion.confidence * 100).toFixed(1)}%
+                              {(analysisResults.engagement.probabilities['Highly Disengage'] * 100).toFixed(1)}%
                             </div>
                           </div>
 
                           <div className="live-stat-item">
-                            <div className="stat-label">Frustration</div>
+                            <div className="stat-label">Engage</div>
                             <div className="stat-value">
-                              {(analysisResults.frustration.confidence * 100).toFixed(1)}%
+                              {(analysisResults.engagement.probabilities['Engage'] * 100).toFixed(1)}%
                             </div>
                           </div>
 
                           <div className="live-stat-item">
-                            <div className="stat-label">Attention Score</div>
+                            <div className="stat-label">Highly Engage</div>
                             <div className="stat-value">
-                              {(analysisResults.attention_score * 100).toFixed(1)}%
+                              {(analysisResults.engagement.probabilities['Highly Engage'] * 100).toFixed(1)}%
                             </div>
                           </div>
 
@@ -1534,7 +1559,8 @@ function Dashboard() {
                           {/* 2. Attendance Opinion */}
                           <div className="attendance-summary" style={{ marginBottom: '20px', width: '100%' }}>
                             {(() => {
-                              const score = analysisResults.attention_score * 100;
+                              const score = (analysisResults.engagementProbabilities?.['Engage'] + analysisResults.engagementProbabilities?.['Highly Engage'] || 
+                                             analysisResults.engagement?.probabilities?.['Engage'] + analysisResults.engagement?.probabilities?.['Highly Engage'] || 0) * 100;
                               let color = '';
                               let recommendation = '';
 
@@ -1570,34 +1596,34 @@ function Dashboard() {
                               flexDirection: 'column',
                               gap: '15px'
                             }}>
-                              {/* Boredom & Engagement */}
+                              {/* Disengage & Highly Disengage */}
                               <div className="live-stat-item" style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                                 <div style={{ textAlign: 'left' }}>
-                                  <div className="stat-label">Boredom</div>
+                                  <div className="stat-label">Disengage</div>
                                   <div className="stat-value">
-                                    {(analysisResults.boredom.confidence * 100).toFixed(1)}%
+                                    {((analysisResults.engagementProbabilities?.['Disengage'] || analysisResults.engagement?.probabilities?.['Disengage'] || 0) * 100).toFixed(1)}%
                                   </div>
                                 </div>
                                 <div style={{ textAlign: 'right' }}>
-                                  <div className="stat-label">Engagement</div>
+                                  <div className="stat-label">Highly Disengage</div>
                                   <div className="stat-value">
-                                    {(analysisResults.engagement.confidence * 100).toFixed(1)}%
+                                    {((analysisResults.engagementProbabilities?.['Highly Disengage'] || analysisResults.engagement?.probabilities?.['Highly Disengage'] || 0) * 100).toFixed(1)}%
                                   </div>
                                 </div>
                               </div>
 
-                              {/* Confusion & Frustration */}
+                              {/* Engage & Highly Engage */}
                               <div className="live-stat-item" style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                                 <div style={{ textAlign: 'left' }}>
-                                  <div className="stat-label">Confusion</div>
+                                  <div className="stat-label">Engage</div>
                                   <div className="stat-value">
-                                    {(analysisResults.confusion.confidence * 100).toFixed(1)}%
+                                    {((analysisResults.engagementProbabilities?.['Engage'] || analysisResults.engagement?.probabilities?.['Engage'] || 0) * 100).toFixed(1)}%
                                   </div>
                                 </div>
                                 <div style={{ textAlign: 'right' }}>
-                                  <div className="stat-label">Frustration</div>
+                                  <div className="stat-label">Highly Engage</div>
                                   <div className="stat-value">
-                                    {(analysisResults.frustration.confidence * 100).toFixed(1)}%
+                                    {((analysisResults.engagementProbabilities?.['Highly Engage'] || analysisResults.engagement?.probabilities?.['Highly Engage'] || 0) * 100).toFixed(1)}%
                                   </div>
                                 </div>
                               </div>
@@ -1606,7 +1632,8 @@ function Dashboard() {
                               <div className="live-stat-item" style={{ gridColumn: '1 / -1' }}>
                                 <div className="stat-label">Attention Score</div>
                                 <div className="stat-value">
-                                  {(analysisResults.attention_score * 100).toFixed(1)}%
+                                  {((analysisResults.engagementProbabilities?.['Engage'] + analysisResults.engagementProbabilities?.['Highly Engage'] ||
+                                     analysisResults.engagement?.probabilities?.['Engage'] + analysisResults.engagement?.probabilities?.['Highly Engage'] || 0) * 100).toFixed(1)}%
                                 </div>
                               </div>
 
@@ -2057,27 +2084,27 @@ function Dashboard() {
                           <h4 style={{ margin: '0 0 10px 0', fontSize: '14px', color: '#000' }}>Analysis Results</h4>
                           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '12px' }}>
                             <div style={{ background: '#f8f9ff', padding: '8px', borderRadius: '6px' }}>
-                              <div style={{ color: '#999', marginBottom: '2px' }}>Boredom</div>
+                              <div style={{ color: '#999', marginBottom: '2px' }}>Disengage</div>
                               <div style={{ fontWeight: 'bold', color: '#333' }}>
-                                {((user.analysisResults?.boredom?.confidence || 0) * 100).toFixed(1)}%
+                                {((user.analysisResults?.engagementProbabilities?.['Disengage'] || 0) * 100).toFixed(1)}%
                               </div>
                             </div>
                             <div style={{ background: '#f8f9ff', padding: '8px', borderRadius: '6px' }}>
-                              <div style={{ color: '#999', marginBottom: '2px' }}>Engagement</div>
-                              <div style={{ fontWeight: 'bold', color: '#4CAF50' }}>
-                                {((user.analysisResults?.engagement?.confidence || 0) * 100).toFixed(1)}%
-                              </div>
-                            </div>
-                            <div style={{ background: '#f8f9ff', padding: '8px', borderRadius: '6px' }}>
-                              <div style={{ color: '#999', marginBottom: '2px' }}>Confusion</div>
-                              <div style={{ fontWeight: 'bold', color: '#333' }}>
-                                {((user.analysisResults?.confusion?.confidence || 0) * 100).toFixed(1)}%
-                              </div>
-                            </div>
-                            <div style={{ background: '#f8f9ff', padding: '8px', borderRadius: '6px' }}>
-                              <div style={{ color: '#999', marginBottom: '2px' }}>Frustration</div>
+                              <div style={{ color: '#999', marginBottom: '2px' }}>Highly Disengage</div>
                               <div style={{ fontWeight: 'bold', color: '#F44336' }}>
-                                {((user.analysisResults?.frustration?.confidence || 0) * 100).toFixed(1)}%
+                                {((user.analysisResults?.engagementProbabilities?.['Highly Disengage'] || 0) * 100).toFixed(1)}%
+                              </div>
+                            </div>
+                            <div style={{ background: '#f8f9ff', padding: '8px', borderRadius: '6px' }}>
+                              <div style={{ color: '#999', marginBottom: '2px' }}>Engage</div>
+                              <div style={{ fontWeight: 'bold', color: '#4CAF50' }}>
+                                {((user.analysisResults?.engagementProbabilities?.['Engage'] || 0) * 100).toFixed(1)}%
+                              </div>
+                            </div>
+                            <div style={{ background: '#f8f9ff', padding: '8px', borderRadius: '6px' }}>
+                              <div style={{ color: '#999', marginBottom: '2px' }}>Highly Engage</div>
+                              <div style={{ fontWeight: 'bold', color: '#333' }}>
+                                {((user.analysisResults?.engagementProbabilities?.['Highly Engage'] || 0) * 100).toFixed(1)}%
                               </div>
                             </div>
                           </div>

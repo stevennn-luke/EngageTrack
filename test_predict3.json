@@ -1,0 +1,1 @@
+{"engagement":{"level":0,"label":"Disengage","confidence":0.3767,"probabilities":{"Disengage":0.3767,"Highly Disengage":0.238,"Engage":0.3183,"Highly Engage":0.067}},"face_box":null,"model_type":"mobilenetv2+student_attention_v4"}
